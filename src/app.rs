@@ -144,6 +144,13 @@ impl Viewer {
             .with_title("3D Viewer")
             .with_inner_size(winit::dpi::LogicalSize::new(1400.0, 860.0))
             .with_min_inner_size(winit::dpi::LogicalSize::new(480.0, 320.0));
+        // Wayland app_id / X11 WM_CLASS, matched against viewer3d.desktop so the
+        // desktop shows the packaged icon for the window.
+        #[cfg(target_os = "linux")]
+        let attributes = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            attributes.with_name("viewer3d", "viewer3d")
+        };
         let window = Arc::new(event_loop.create_window(attributes)?);
 
         let ui = UiState::default();

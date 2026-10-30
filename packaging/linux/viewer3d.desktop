@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=3D Viewer
+GenericName=3D Model Viewer
+Comment=View glTF/GLB, OBJ and STL models
+Exec=viewer3d %f
+Icon=viewer3d
+Terminal=false
+Categories=Graphics;3DGraphics;Viewer;
+MimeType=model/gltf+json;model/gltf-binary;model/obj;model/stl;application/sla;
+Keywords=3D;model;mesh;gltf;glb;obj;stl;
+StartupWMClass=viewer3d

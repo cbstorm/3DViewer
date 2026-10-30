@@ -1,0 +1,12 @@
+Package: viewer3d
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: @MAINTAINER@
+Installed-Size: @SIZE@
+Depends: libc6 (>= @GLIBC@), libgcc-s1, libvulkan1, libxkbcommon0
+Recommends: mesa-vulkan-drivers | vulkan-icd, libwayland-client0, libwayland-cursor0, libx11-xcb1, libxcursor1, libxi6, libxrandr2, libxkbcommon-x11-0, xdg-desktop-portal
+Section: graphics
+Priority: optional
+Description: Small, fast 3D model viewer
+ Desktop viewer for glTF/GLB, OBJ and STL models, built on Vulkan
+ with an egui interface.

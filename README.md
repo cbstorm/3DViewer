@@ -48,6 +48,7 @@ Set `RUST_LOG=debug` for more logging.
 | Command | Output | Build on |
 | --- | --- | --- |
 | `make linux` | `viewer3d-<ver>-linux-x86_64.tar.gz` | Linux |
+| `make deb` | `viewer3d_<ver>_amd64.deb` with a desktop entry and icon (`sudo apt install ./dist/viewer3d_<ver>_amd64.deb`) | Linux (`dpkg-deb`) |
 | `make windows` | `viewer3d-<ver>-windows-x86_64.zip` | Windows (MSVC), or Linux/macOS with MinGW-w64 (`apt install mingw-w64` / `brew install mingw-w64`) |
 | `make windows-docker` | same zip, cross-compiled in Docker | Linux/macOS with Docker, no MinGW needed |
 | `make macos` | `3D Viewer.app` (universal arm64 + x86_64) and `viewer3d-<ver>-macos-universal.zip` | macOS (Xcode command line tools) |

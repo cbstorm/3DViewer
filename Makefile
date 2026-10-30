@@ -33,7 +33,7 @@ MOLTENVK ?= $(firstword $(wildcard \
 
 DOCKER_IMAGE := $(APP)-windows-build
 
-.PHONY: help build run test lint check-targets linux windows windows-docker macos dist clean
+.PHONY: help build run test lint check-targets linux deb windows windows-docker macos dist clean
 
 help:
 	@echo "3D Viewer $(VERSION) - host: $(HOST)"
@@ -47,6 +47,7 @@ help:
 	@echo
 	@echo "Release packages (written to $(DIST)/):"
 	@echo "  make linux           $(LINUX_TARGET) tarball            (Linux host)"
+	@echo "  make deb             Debian/Ubuntu .deb with desktop entry and icon (Linux host)"
 	@echo "  make windows         $(WINDOWS_TARGET) zip"
 	@echo "                       (Windows host, or MinGW: apt install mingw-w64)"
 	@echo "  make windows-docker  Windows zip built in Docker, no MinGW install needed"
@@ -76,18 +77,44 @@ check-targets:
 # ---------------------------------------------------------------- Linux
 
 LINUX_PKG := $(APP)-$(VERSION)-linux-x86_64
+LINUX_BIN := target/$(LINUX_TARGET)/release/$(APP)
 
-linux:
+.PHONY: linux-release
+linux-release:
 ifneq ($(HOST),linux)
 	$(error Linux packages must be built on Linux)
 endif
 	rustup target add $(LINUX_TARGET)
 	$(CARGO) build --release --locked --target $(LINUX_TARGET)
+
+linux: linux-release
 	rm -rf $(DIST)/$(LINUX_PKG)
 	mkdir -p $(DIST)/$(LINUX_PKG)
-	cp target/$(LINUX_TARGET)/release/$(APP) README.md $(DIST)/$(LINUX_PKG)/
+	cp $(LINUX_BIN) README.md $(DIST)/$(LINUX_PKG)/
 	tar -C $(DIST) -czf $(DIST)/$(LINUX_PKG).tar.gz $(LINUX_PKG)
 	@echo "Built $(DIST)/$(LINUX_PKG).tar.gz"
+
+# Debian/Ubuntu package: binary, desktop entry and hicolor icon. The libc6
+# minimum comes from the newest GLIBC symbol version the binary uses.
+DEB_ARCH   := amd64
+DEB_PKG    := $(APP)_$(VERSION)_$(DEB_ARCH)
+DEB_ROOT   := $(DIST)/$(DEB_PKG)
+MAINTAINER ?= $(shell git config user.name) <$(shell git config user.email)>
+
+deb: linux-release
+	rm -rf $(DEB_ROOT) $(DEB_ROOT).deb
+	install -Dm755 $(LINUX_BIN) $(DEB_ROOT)/usr/bin/$(APP)
+	install -Dm644 packaging/linux/$(APP).desktop $(DEB_ROOT)/usr/share/applications/$(APP).desktop
+	install -Dm644 packaging/linux/$(APP).svg $(DEB_ROOT)/usr/share/icons/hicolor/scalable/apps/$(APP).svg
+	install -Dm644 README.md $(DEB_ROOT)/usr/share/doc/$(APP)/README.md
+	mkdir -p $(DEB_ROOT)/DEBIAN
+	glibc=$$(objdump -T $(LINUX_BIN) | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -n 1); \
+	size=$$(du -sk $(DEB_ROOT)/usr | cut -f1); \
+	sed -e 's/@VERSION@/$(VERSION)/' -e 's/@ARCH@/$(DEB_ARCH)/' \
+		-e 's/@MAINTAINER@/$(MAINTAINER)/' -e "s/@SIZE@/$$size/" -e "s/@GLIBC@/$$glibc/" \
+		packaging/linux/control > $(DEB_ROOT)/DEBIAN/control
+	dpkg-deb --root-owner-group --build $(DEB_ROOT) $(DEB_ROOT).deb
+	@echo "Built $(DEB_ROOT).deb"
 
 # ---------------------------------------------------------------- Windows
 
@@ -161,7 +188,7 @@ endif
 # ---------------------------------------------------------------- all
 
 ifeq ($(HOST),linux)
-dist: linux windows
+dist: linux deb windows
 else ifeq ($(HOST),macos)
 dist: macos windows
 else
