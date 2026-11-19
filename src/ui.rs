@@ -1,8 +1,12 @@
-//! egui panels: menu bar, scene tree, material inspector, view settings, status bar.
+//! egui panels: menu bar, scene tree, viewport sidebar (item / view / light tabs), status bar.
+
+mod sidebar;
 
 use std::path::Path;
 
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText};
+
+use sidebar::{Panels, Sidebar, Tab};
 
 use crate::{
     renderer::{FrameStats, GpuInfo, ViewMode, ViewSettings},
@@ -24,7 +28,7 @@ pub enum UiAction {
 pub struct UiState {
     pub selected_node: Option<usize>,
     pub show_scene_panel: bool,
-    pub show_inspector: bool,
+    pub sidebar: Sidebar,
     pub show_help: bool,
     pub error: Option<String>,
     pub vsync: bool,
@@ -36,7 +40,7 @@ impl Default for UiState {
         UiState {
             selected_node: None,
             show_scene_panel: true,
-            show_inspector: true,
+            sidebar: Sidebar::default(),
             show_help: false,
             error: None,
             vsync: true,
@@ -61,6 +65,8 @@ pub struct UiContext<'a> {
     pub timings: &'a Timings,
     pub gpu: &'a GpuInfo,
     pub loading: Option<&'a Path>,
+    /// A viewport screenshot is pending: keep overlays out of the 3D view.
+    pub hide_overlays: bool,
 }
 
 pub struct UiOutput {
@@ -78,6 +84,7 @@ pub fn draw(ui: &mut egui::Ui, cx: UiContext) -> UiOutput {
         timings,
         gpu,
         loading,
+        hide_overlays,
     } = cx;
     let mut actions = Vec::new();
     shortcuts(ui.ctx(), settings, state, &mut actions);
@@ -101,24 +108,19 @@ pub fn draw(ui: &mut egui::Ui, cx: UiContext) -> UiOutput {
                 });
             });
     }
-    if state.show_inspector {
-        egui::Panel::right("inspector")
-            .resizable(true)
-            .default_size(290.0)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    view_settings(ui, settings, gpu, &mut actions);
-                    ui.separator();
-                    inspector(ui, scene.as_deref_mut(), state);
-                });
-            });
-    }
-
     let viewport = egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show(ui, |ui| {
             let rect = ui.max_rect();
             viewport_input(ui, rect, camera);
+            if !hide_overlays {
+                let selected = state.selected_node;
+                state.sidebar.show(ui, rect, |ui, tab, panels| match tab {
+                    Tab::Item => inspector(ui, panels, scene.as_deref_mut(), selected),
+                    Tab::View => view_settings(ui, panels, settings, camera, gpu, &mut actions),
+                    Tab::Light => light_settings(ui, panels, settings),
+                });
+            }
             if let Some(path) = loading {
                 overlay(ui, rect, |ui| {
                     ui.horizontal(|ui| {
@@ -126,7 +128,7 @@ pub fn draw(ui: &mut egui::Ui, cx: UiContext) -> UiOutput {
                         ui.label(format!("Loading {}…", file_name(path)));
                     });
                 });
-            } else if scene.as_ref().is_some_and(|s| s.source.is_none()) {
+            } else if !hide_overlays && scene.as_ref().is_some_and(|s| s.source.is_none()) {
                 hint(
                     ui,
                     rect,
@@ -198,6 +200,9 @@ fn shortcuts(
         if pressed(Key::B) {
             settings.show_bounds ^= true;
         }
+        if pressed(Key::N) {
+            state.sidebar.open ^= true;
+        }
         for (key, mode) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4]
             .into_iter()
             .zip(ViewMode::ALL)
@@ -264,7 +269,7 @@ fn menu_bar(ui: &mut egui::Ui, has_model: bool, state: &mut UiState, actions: &m
     });
     ui.menu_button("Window", |ui| {
         ui.checkbox(&mut state.show_scene_panel, "Scene panel");
-        ui.checkbox(&mut state.show_inspector, "Inspector");
+        ui.checkbox(&mut state.sidebar.open, "Sidebar (N)");
     });
     ui.menu_button("Help", |ui| {
         if ui
@@ -400,51 +405,87 @@ fn scene_panel(
         });
 }
 
+/// Sidebar "View" tab.
 fn view_settings(
     ui: &mut egui::Ui,
+    panels: &mut Panels,
     s: &mut ViewSettings,
+    camera: &mut OrbitCamera,
     gpu: &GpuInfo,
     actions: &mut Vec<UiAction>,
 ) {
-    ui.heading("View");
-    for (i, mode) in ViewMode::ALL.into_iter().enumerate() {
-        let enabled = gpu.wireframe || !mode.needs_wireframe();
-        ui.add_enabled_ui(enabled, |ui| {
-            ui.radio_value(&mut s.mode, mode, format!("{}  ({})", mode.label(), i + 1))
-                .on_disabled_hover_text("This GPU does not support wireframe rendering");
-        });
-    }
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut s.show_grid, "Grid");
-        ui.checkbox(&mut s.show_bounds, "Bounds");
-        ui.checkbox(&mut s.frustum_culling, "Culling");
-    });
-    ui.horizontal(|ui| {
-        if ui.button("Fit (F)").clicked() {
-            actions.push(UiAction::FitView);
-        }
-        if ui.button("Reset (R)").clicked() {
-            actions.push(UiAction::ResetView);
-        }
-    });
-
-    egui::CollapsingHeader::new("Lighting")
-        .default_open(false)
-        .show(ui, |ui| {
-            ui.add(egui::Slider::new(&mut s.light_intensity, 0.0..=10.0).text("Light"));
-            ui.add(egui::Slider::new(&mut s.ambient, 0.0..=2.0).text("Ambient"));
-            ui.add(egui::Slider::new(&mut s.light_azimuth, -180.0..=180.0).text("Azimuth"));
-            ui.add(egui::Slider::new(&mut s.light_elevation, -90.0..=90.0).text("Elevation"));
-            ui.horizontal(|ui| {
-                ui.label("Background");
-                ui.color_edit_button_srgb(&mut s.background);
+    panels.panel(ui, "view_shading", "Shading", true, |ui| {
+        for (i, mode) in ViewMode::ALL.into_iter().enumerate() {
+            let enabled = gpu.wireframe || !mode.needs_wireframe();
+            ui.add_enabled_ui(enabled, |ui| {
+                ui.radio_value(&mut s.mode, mode, format!("{}  ({})", mode.label(), i + 1))
+                    .on_disabled_hover_text("This GPU does not support wireframe rendering");
             });
+        }
+    });
+    panels.panel(ui, "view_overlays", "Overlays", true, |ui| {
+        ui.checkbox(&mut s.show_grid, "Grid  (G)");
+        ui.checkbox(&mut s.show_bounds, "Bounds  (B)");
+    });
+    panels.panel(ui, "view_camera", "Camera", true, |ui| {
+        let mut fov = camera.fov_y.to_degrees();
+        if ui
+            .add(
+                egui::Slider::new(&mut fov, 10.0..=120.0)
+                    .text("Field of view")
+                    .suffix("°"),
+            )
+            .changed()
+        {
+            camera.fov_y = fov.to_radians();
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Fit (F)").clicked() {
+                actions.push(UiAction::FitView);
+            }
+            if ui.button("Reset (R)").clicked() {
+                actions.push(UiAction::ResetView);
+            }
         });
+    });
+    panels.panel(ui, "view_performance", "Performance", false, |ui| {
+        ui.checkbox(&mut s.frustum_culling, "Frustum culling");
+    });
 }
 
-fn inspector(ui: &mut egui::Ui, scene: Option<&mut Scene>, state: &UiState) {
-    ui.heading("Inspector");
-    let (Some(scene), Some(index)) = (scene, state.selected_node) else {
+/// Sidebar "Light" tab.
+fn light_settings(ui: &mut egui::Ui, panels: &mut Panels, s: &mut ViewSettings) {
+    panels.panel(ui, "light_key", "Key light", true, |ui| {
+        ui.add(egui::Slider::new(&mut s.light_intensity, 0.0..=10.0).text("Intensity"));
+        ui.add(
+            egui::Slider::new(&mut s.light_azimuth, -180.0..=180.0)
+                .text("Azimuth")
+                .suffix("°"),
+        );
+        ui.add(
+            egui::Slider::new(&mut s.light_elevation, -90.0..=90.0)
+                .text("Elevation")
+                .suffix("°"),
+        );
+    });
+    panels.panel(ui, "light_environment", "Environment", true, |ui| {
+        ui.add(egui::Slider::new(&mut s.ambient, 0.0..=2.0).text("Ambient"));
+        ui.horizontal(|ui| {
+            ui.label("Background");
+            ui.color_edit_button_srgb(&mut s.background);
+        });
+    });
+}
+
+/// Sidebar "Item" tab: the selected node and its materials.
+fn inspector(
+    ui: &mut egui::Ui,
+    panels: &mut Panels,
+    scene: Option<&mut Scene>,
+    selected: Option<usize>,
+) {
+    let (Some(scene), Some(index)) = (scene, selected) else {
+        ui.add_space(4.0);
         ui.label(RichText::new("Select a node in the scene panel.").weak());
         return;
     };
@@ -454,77 +495,97 @@ fn inspector(ui: &mut egui::Ui, scene: Option<&mut Scene>, state: &UiState) {
     let (scale, rotation, translation) = node.transform.to_scale_rotation_translation();
     let (ax, ay, az) = rotation.to_euler(glam::EulerRot::XYZ);
     let mesh_index = node.mesh;
-    ui.strong(&node.name);
-    egui::Grid::new("node_transform")
-        .num_columns(2)
-        .show(ui, |ui| {
-            ui.label("Translation");
-            ui.label(format!(
-                "{:.3}, {:.3}, {:.3}",
-                translation.x, translation.y, translation.z
-            ));
-            ui.end_row();
-            ui.label("Rotation");
-            ui.label(format!(
-                "{:.1}°, {:.1}°, {:.1}°",
-                ax.to_degrees(),
-                ay.to_degrees(),
-                az.to_degrees()
-            ));
-            ui.end_row();
-            ui.label("Scale");
-            ui.label(format!("{:.3}, {:.3}, {:.3}", scale.x, scale.y, scale.z));
-            ui.end_row();
-        });
+    ui.add_space(2.0);
+    ui.label(RichText::new(&node.name).strong().size(14.0));
+    ui.add_space(4.0);
+
+    panels.panel(ui, "item_transform", "Transform", true, |ui| {
+        egui::Grid::new("node_transform")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("Translation");
+                ui.label(format!(
+                    "{:.3}, {:.3}, {:.3}",
+                    translation.x, translation.y, translation.z
+                ));
+                ui.end_row();
+                ui.label("Rotation");
+                ui.label(format!(
+                    "{:.1}°, {:.1}°, {:.1}°",
+                    ax.to_degrees(),
+                    ay.to_degrees(),
+                    az.to_degrees()
+                ));
+                ui.end_row();
+                ui.label("Scale");
+                ui.label(format!("{:.3}, {:.3}, {:.3}", scale.x, scale.y, scale.z));
+                ui.end_row();
+            });
+    });
 
     let mesh = &scene.meshes[mesh_index];
-    ui.label(format!(
-        "Mesh: {} ({} primitives)",
-        mesh.name,
-        mesh.primitives.len()
-    ));
     let materials: Vec<(usize, usize, usize)> = mesh
         .primitives
         .iter()
         .map(|p| (p.material, p.vertex_count, p.triangle_count()))
         .collect();
+    panels.panel(ui, "item_mesh", "Mesh", true, |ui| {
+        let (vertices, triangles) = materials
+            .iter()
+            .fold((0, 0), |(v, t), &(_, pv, pt)| (v + pv, t + pt));
+        egui::Grid::new("node_mesh").num_columns(2).show(ui, |ui| {
+            ui.label("Name");
+            ui.label(&mesh.name);
+            ui.end_row();
+            ui.label("Primitives");
+            ui.label(materials.len().to_string());
+            ui.end_row();
+            ui.label("Vertices");
+            ui.label(format_count(vertices));
+            ui.end_row();
+            ui.label("Triangles");
+            ui.label(format_count(triangles));
+            ui.end_row();
+        });
+    });
 
     for (pi, (material_index, vertices, triangles)) in materials.into_iter().enumerate() {
         let textures = &scene.textures;
         let m = &mut scene.materials[material_index];
-        egui::CollapsingHeader::new(format!("Primitive {pi}: {}", m.name))
-            .id_salt(("prim", index, pi))
-            .default_open(pi == 0)
-            .show(ui, |ui| {
-                ui.label(format!(
+        let title = format!("Primitive {pi} · {}", m.name);
+        panels.panel(ui, ("item_primitive", pi), &title, pi == 0, |ui| {
+            ui.label(
+                RichText::new(format!(
                     "{} vertices, {} triangles",
                     format_count(vertices),
                     format_count(triangles)
-                ));
-                ui.horizontal(|ui| {
-                    ui.label("Base color");
-                    ui.color_edit_button_rgba_unmultiplied(&mut m.base_color);
-                });
-                ui.add(egui::Slider::new(&mut m.metallic, 0.0..=1.0).text("Metallic"));
-                ui.add(egui::Slider::new(&mut m.roughness, 0.0..=1.0).text("Roughness"));
-                ui.label(format!(
-                    "Alpha: {}",
-                    match m.alpha_mode {
-                        AlphaMode::Opaque => "opaque".to_string(),
-                        AlphaMode::Mask(c) => format!("mask ({c:.2})"),
-                        AlphaMode::Blend => "blend".to_string(),
-                    }
-                ));
-                for (label, tex) in [
-                    ("Base color map", m.base_color_texture),
-                    ("Metal/rough map", m.metallic_roughness_texture),
-                    ("Emissive map", m.emissive_texture),
-                ] {
-                    if let Some(t) = tex.and_then(|i| textures.get(i)) {
-                        ui.label(format!("{label}: {} ({}×{})", t.name, t.width, t.height));
-                    }
-                }
+                ))
+                .weak(),
+            );
+            ui.horizontal(|ui| {
+                ui.label("Base color");
+                ui.color_edit_button_rgba_unmultiplied(&mut m.base_color);
             });
+            ui.add(egui::Slider::new(&mut m.metallic, 0.0..=1.0).text("Metallic"));
+            ui.add(egui::Slider::new(&mut m.roughness, 0.0..=1.0).text("Roughness"));
+            ui.label(format!(
+                "Alpha: {}",
+                match m.alpha_mode {
+                    AlphaMode::Opaque => "opaque".to_string(),
+                    AlphaMode::Mask(c) => format!("mask ({c:.2})"),
+                    AlphaMode::Blend => "blend".to_string(),
+                }
+            ));
+            for (label, tex) in [
+                ("Base color map", m.base_color_texture),
+                ("Metal/rough map", m.metallic_roughness_texture),
+                ("Emissive map", m.emissive_texture),
+            ] {
+                if let Some(t) = tex.and_then(|i| textures.get(i)) {
+                    ui.label(format!("{label}: {} ({}×{})", t.name, t.width, t.height));
+                }
+            }
+        });
     }
 }
 
@@ -592,6 +653,9 @@ fn help(ui: &mut egui::Ui) {
                 ("R", "Reset camera"),
                 ("1 – 4", "Shaded / shaded + wire / wireframe / normals"),
                 ("G / B", "Toggle grid / bounds"),
+                ("N", "Toggle sidebar"),
+                ("Ctrl + scroll on sidebar", "Switch sidebar tab"),
+                ("Ctrl + click panel header", "Open it, collapse the others"),
                 ("Ctrl+O", "Open model"),
                 ("Esc", "Clear selection"),
                 ("Drag & drop", "Open a .gltf, .glb, .obj or .stl file"),

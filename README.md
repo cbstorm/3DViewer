@@ -13,8 +13,10 @@ Vulkan (`ash`) with an `egui` interface. It follows the design in [requirements.
 - View modes: shaded, shaded + wireframe, wireframe, normals. Ground grid, scene bounds,
   highlighted bounds for the selected node.
 - Camera: orbit, pan, zoom, fit-to-model, reset.
-- UI: scene panel (stats, up axis, per-node visibility), material inspector with live
-  base color / metallic / roughness editing, lighting controls, status bar with FPS,
+- UI: scene panel (stats, up axis, per-node visibility); a Blender-style viewport sidebar
+  (`N`) with Item / View / Light tabs and collapsible panels, holding the material inspector
+  (live base color / metallic / roughness editing), view, camera and lighting controls;
+  status bar with FPS,
   CPU and GPU frame time (timestamp queries), draw calls, triangles and culled primitives.
 - Loading runs on a worker thread; the UI stays responsive and load errors show in a dialog.
 - Screenshots: *File → Save screenshot…* (3D viewport only) or `--screenshot` (whole window).
@@ -81,6 +83,9 @@ Platform notes for packaging:
 | `R` | Reset camera |
 | `1` – `4` | Shaded / shaded + wireframe / wireframe / normals |
 | `G` / `B` | Toggle grid / bounds |
+| `N` | Toggle sidebar (or drag its edge to resize / collapse) |
+| `Ctrl` + scroll over sidebar | Switch sidebar tab |
+| `Ctrl` + click panel header | Open that panel, collapse the others |
 | `Ctrl+O` | Open model |
 | `Esc` | Clear selection |
 | `F1` | Controls help |

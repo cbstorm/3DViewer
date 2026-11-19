@@ -382,6 +382,7 @@ impl Viewer {
                     timings: &self.timings,
                     gpu: &gpu_info,
                     loading: self.loading.as_deref(),
+                    hide_overlays: self.capture.as_ref().is_some_and(|c| c.crop.is_some()),
                 },
             ));
         });
