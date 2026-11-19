@@ -79,6 +79,7 @@ Platform notes for packaging:
 | Left drag | Orbit |
 | Right / middle drag, Shift + left drag | Pan |
 | Scroll | Zoom |
+| Left click | Select the node under the cursor (empty space clears) |
 | Double-click, `F` | Fit to model |
 | `R` | Reset camera |
 | `1` – `4` | Shaded / shaded + wireframe / wireframe / normals |
@@ -145,4 +146,4 @@ Notes:
 ## Not yet implemented
 
 Normal maps (no tangents), skinning and animation, glTF texture transforms and secondary UV
-sets, image-based lighting, picking in the viewport, and multi-draw indirect.
+sets, image-based lighting, and multi-draw indirect.

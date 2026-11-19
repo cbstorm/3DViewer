@@ -1,6 +1,6 @@
 use glam::{Mat4, Vec3, Vec4};
 
-use super::mesh::Aabb;
+use super::{mesh::Aabb, pick::Ray};
 
 /// Orbit camera around a target point. Y is up.
 #[derive(Debug, Clone, Copy)]
@@ -58,6 +58,19 @@ impl OrbitCamera {
     pub fn projection(&self, aspect: f32) -> Mat4 {
         let near = (self.distance * 1e-3).max(1e-5);
         Mat4::perspective_infinite_reverse_rh(self.fov_y, aspect.max(1e-3), near)
+    }
+
+    /// World-space ray through a point in normalized device coordinates
+    /// (x right, y up, both in [-1, 1]).
+    pub fn ray(&self, ndc_x: f32, ndc_y: f32, aspect: f32) -> Ray {
+        let h = (self.fov_y * 0.5).tan();
+        let dir = self.forward()
+            + self.right() * (ndc_x * h * aspect.max(1e-3))
+            + self.up() * (ndc_y * h);
+        Ray {
+            origin: self.eye(),
+            dir,
+        }
     }
 
     pub fn orbit(&mut self, dx_pixels: f32, dy_pixels: f32) {
@@ -152,6 +165,19 @@ mod tests {
         assert!(!frustum.intersects(&unit_box_at(camera.target + camera.right() * 1000.0)));
         // Very far ahead: the far plane is at infinity.
         assert!(frustum.intersects(&unit_box_at(camera.eye() + camera.forward() * 1e5)));
+    }
+
+    #[test]
+    fn ray_matches_projection() {
+        let camera = OrbitCamera::default();
+        let aspect = 1.6;
+        let view_proj = camera.projection(aspect) * camera.view();
+        for (x, y) in [(0.0, 0.0), (0.7, -0.3), (-0.9, 0.95)] {
+            let ray = camera.ray(x, y, aspect);
+            let clip = view_proj * (ray.origin + ray.dir * 3.0).extend(1.0);
+            assert!((clip.x / clip.w - x).abs() < 1e-4, "x {x}");
+            assert!((clip.y / clip.w - y).abs() < 1e-4, "y {y}");
+        }
     }
 
     #[test]

@@ -299,8 +299,8 @@ impl Viewer {
         }
     }
 
-    /// Upload a scene to the GPU and make it current. CPU geometry is released
-    /// afterwards; only counts and bounds are kept.
+    /// Upload a scene to the GPU and make it current. Vertex data is released
+    /// afterwards; counts, bounds, positions and indices are kept.
     fn set_scene(&mut self, mut scene: Scene) -> Result<()> {
         self.renderer.upload_scene(&scene)?;
         for p in scene.meshes.iter_mut().flat_map(|m| &mut m.primitives) {

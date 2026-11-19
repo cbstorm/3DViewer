@@ -86,6 +86,8 @@ pub struct Primitive {
     pub indices: Vec<u32>,
     pub material: usize,
     pub bounds: Aabb,
+    /// Vertex positions, kept after upload for picking.
+    pub positions: Vec<Vec3>,
     /// Counts survive after the CPU-side geometry is released post-upload.
     pub vertex_count: usize,
     pub index_count: usize,
@@ -93,8 +95,10 @@ pub struct Primitive {
 
 impl Primitive {
     pub fn new(vertices: Vec<Vertex>, indices: Vec<u32>, material: usize) -> Self {
-        let bounds = Aabb::from_points(vertices.iter().map(|v| Vec3::from(v.position)));
+        let positions: Vec<Vec3> = vertices.iter().map(|v| Vec3::from(v.position)).collect();
+        let bounds = Aabb::from_points(positions.iter().copied());
         Primitive {
+            positions,
             vertex_count: vertices.len(),
             index_count: indices.len(),
             vertices,
@@ -108,10 +112,10 @@ impl Primitive {
         self.index_count / 3
     }
 
-    /// Release CPU geometry once it lives on the GPU.
+    /// Release the full vertex data once it lives on the GPU. Positions and
+    /// indices stay for picking.
     pub fn release_geometry(&mut self) {
         self.vertices = Vec::new();
-        self.indices = Vec::new();
     }
 }
 

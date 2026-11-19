@@ -1,6 +1,7 @@
 pub mod camera;
 pub mod demo;
 pub mod mesh;
+pub mod pick;
 #[allow(clippy::module_inception)]
 pub mod scene;
 

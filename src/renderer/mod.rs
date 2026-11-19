@@ -930,15 +930,22 @@ impl Renderer {
             draw_list(&blended, MODE_FLAT, color, &mut stats);
         }
 
-        // Bounding boxes: whole scene on request, selected node always.
+        // Bounding boxes as unit-cube transforms: whole scene (world-aligned) on
+        // request, selected node always (its local box, oriented with the node).
         let mut boxes = Vec::new();
         if settings.show_bounds {
             if let Some(b) = scene_bounds {
-                boxes.push((b, Vec4::new(0.9, 0.9, 0.3, 0.8)));
+                boxes.push((b.unit_cube_transform(), Vec4::new(0.9, 0.9, 0.3, 0.8)));
             }
         }
         if let Some(node) = input.selected_node.and_then(|i| scene.nodes.get(i)) {
-            boxes.push((scene.node_bounds(node), Vec4::new(1.0, 0.55, 0.1, 1.0)));
+            let local = scene.meshes[node.mesh].bounds();
+            if !local.is_empty() {
+                boxes.push((
+                    scene.world_transform(node) * local.unit_cube_transform(),
+                    Vec4::new(1.0, 0.55, 0.1, 1.0),
+                ));
+            }
         }
         if !boxes.is_empty() {
             unsafe {
@@ -949,9 +956,9 @@ impl Renderer {
                 );
             }
             bind_frame_set(self.pipelines.lines_layout);
-            for (b, color) in boxes {
+            for (model, color) in boxes {
                 let push = LinePush {
-                    model: b.unit_cube_transform(),
+                    model,
                     color,
                     params: Vec4::ZERO,
                 };

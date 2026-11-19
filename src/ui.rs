@@ -27,6 +27,8 @@ pub enum UiAction {
 
 pub struct UiState {
     pub selected_node: Option<usize>,
+    /// Selection came from the viewport: scroll the node list to it.
+    pub scroll_to_selected: bool,
     pub show_scene_panel: bool,
     pub sidebar: Sidebar,
     pub show_help: bool,
@@ -39,6 +41,7 @@ impl Default for UiState {
     fn default() -> Self {
         UiState {
             selected_node: None,
+            scroll_to_selected: false,
             show_scene_panel: true,
             sidebar: Sidebar::default(),
             show_help: false,
@@ -112,7 +115,12 @@ pub fn draw(ui: &mut egui::Ui, cx: UiContext) -> UiOutput {
         .frame(egui::Frame::NONE)
         .show(ui, |ui| {
             let rect = ui.max_rect();
-            viewport_input(ui, rect, camera);
+            if let Some(pos) = viewport_input(ui, rect, camera) {
+                if let Some(scene) = scene.as_deref() {
+                    state.selected_node = pick(scene, camera, rect, pos);
+                    state.scroll_to_selected = state.selected_node.is_some();
+                }
+            }
             if !hide_overlays {
                 let selected = state.selected_node;
                 state.sidebar.show(ui, rect, |ui, tab, panels| match tab {
@@ -385,24 +393,32 @@ fn scene_panel(
     });
     let row_height = ui.spacing().interact_size.y;
     let total = scene.nodes.len();
-    egui::ScrollArea::vertical()
+    let max_height = ui.available_height().max(200.0);
+    let mut nodes = egui::ScrollArea::vertical()
         .id_salt("nodes")
-        .max_height(ui.available_height().max(200.0))
-        .show_rows(ui, row_height, total, |ui, range| {
-            for i in range {
-                let node = &mut scene.nodes[i];
-                ui.horizontal(|ui| {
-                    ui.add_space(node.depth as f32 * 10.0);
-                    if ui.checkbox(&mut node.visible, "").changed() {
-                        actions.push(UiAction::SceneChanged);
-                    }
-                    let selected = state.selected_node == Some(i);
-                    if ui.selectable_label(selected, &node.name).clicked() {
-                        state.selected_node = if selected { None } else { Some(i) };
-                    }
-                });
-            }
-        });
+        .max_height(max_height);
+    if let Some(i) = state.selected_node.filter(|_| state.scroll_to_selected) {
+        // Rows are virtualized, so scroll by offset rather than scroll_to_me.
+        let pitch = row_height + ui.spacing().item_spacing.y;
+        let offset = i as f32 * pitch - (max_height - row_height) * 0.5;
+        nodes = nodes.vertical_scroll_offset(offset.max(0.0));
+    }
+    state.scroll_to_selected = false;
+    nodes.show_rows(ui, row_height, total, |ui, range| {
+        for i in range {
+            let node = &mut scene.nodes[i];
+            ui.horizontal(|ui| {
+                ui.add_space(node.depth as f32 * 10.0);
+                if ui.checkbox(&mut node.visible, "").changed() {
+                    actions.push(UiAction::SceneChanged);
+                }
+                let selected = state.selected_node == Some(i);
+                if ui.selectable_label(selected, &node.name).clicked() {
+                    state.selected_node = if selected { None } else { Some(i) };
+                }
+            });
+        }
+    });
 }
 
 /// Sidebar "View" tab.
@@ -590,8 +606,13 @@ fn inspector(
 }
 
 /// Camera control over the 3D viewport: drag to orbit, right/middle-drag or
-/// shift-drag to pan, scroll to zoom, double-click to fit.
-fn viewport_input(ui: &mut egui::Ui, rect: egui::Rect, camera: &mut OrbitCamera) {
+/// shift-drag to pan, scroll to zoom, double-click to fit. Returns the
+/// position of a left click (press and release without dragging).
+fn viewport_input(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    camera: &mut OrbitCamera,
+) -> Option<egui::Pos2> {
     let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
     let delta = response.drag_delta();
     let shift = ui.input(|i| i.modifiers.shift);
@@ -613,6 +634,20 @@ fn viewport_input(ui: &mut egui::Ui, rect: egui::Rect, camera: &mut OrbitCamera)
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new("fit_request"), true));
     }
+    response
+        .clicked_by(egui::PointerButton::Primary)
+        .then(|| response.interact_pointer_pos())
+        .flatten()
+}
+
+/// Node under `pos` (in points) in the viewport `rect`, if any.
+fn pick(scene: &Scene, camera: &OrbitCamera, rect: egui::Rect, pos: egui::Pos2) -> Option<usize> {
+    if rect.width() < 1.0 || rect.height() < 1.0 {
+        return None;
+    }
+    let uv = (pos - rect.min) / rect.size();
+    let ray = camera.ray(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, rect.aspect_ratio());
+    scene.pick(ray).map(|hit| hit.node)
 }
 
 /// Whether the viewport was double-clicked this frame.
@@ -649,6 +684,7 @@ fn help(ui: &mut egui::Ui) {
                 ("Left drag", "Orbit"),
                 ("Right / middle drag, Shift + left drag", "Pan"),
                 ("Scroll", "Zoom"),
+                ("Left click", "Select node (empty space clears)"),
                 ("Double-click, F", "Fit to model"),
                 ("R", "Reset camera"),
                 ("1 – 4", "Shaded / shaded + wire / wireframe / normals"),
