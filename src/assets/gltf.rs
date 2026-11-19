@@ -1,15 +1,29 @@
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    time::Duration,
+};
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Context, Result};
 use glam::Mat4;
-use gltf::mesh::Mode;
+use gltf::{json::validation::Validate, mesh::Mode, Document, Gltf};
 
 use crate::scene::{
     generate_normals, AlphaMode, Material, Mesh, Node, Primitive, Scene, Texture, UpAxis, Vertex,
 };
 
+const KHR_DRACO: &str = "KHR_draco_mesh_compression";
+
 pub fn load(path: &Path) -> Result<Scene> {
-    let (document, buffers, images) = gltf::import(path)?;
+    let bytes = std::fs::read(path)?;
+    // `gltf::import` rejects Draco files: the extension is unknown to the crate and
+    // the compressed accessors have no bufferView. Validate ourselves instead and
+    // excuse exactly those errors.
+    let Gltf { document, blob } = Gltf::from_slice_without_validation(&bytes)?;
+    validate(&document)?;
+    let base = path.parent().unwrap_or_else(|| Path::new("./"));
+    let buffers = gltf::import_buffers(&document, Some(base), blob)?;
+    let images = gltf::import_images(&document, Some(base), &buffers)?;
 
     let mut textures = Textures {
         images: &images,
@@ -27,7 +41,7 @@ pub fn load(path: &Path) -> Result<Scene> {
     for mesh in document.meshes() {
         let primitives: Vec<Primitive> = mesh
             .primitives()
-            .filter_map(|p| match convert_primitive(&p, &buffers) {
+            .filter_map(|p| match convert_primitive(&document, &p, &buffers) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("mesh {:?}: skipping primitive: {e}", mesh.name());
@@ -109,15 +123,73 @@ fn visit_node(
     }
 }
 
-fn convert_primitive(
+/// Run the glTF crate's validation, ignoring only what Draco compression explains:
+/// the required-extension check for KHR_draco_mesh_compression and the missing
+/// bufferView on accessors whose data lives in a Draco blob.
+fn validate(document: &Document) -> Result<()> {
+    let root = document.as_json();
+    let mut draco_accessors = HashSet::new();
+    for mesh in &root.meshes {
+        for p in &mesh.primitives {
+            if draco_extension(p).is_some() {
+                draco_accessors.extend(p.attributes.values().map(|a| a.value()));
+                draco_accessors.extend(p.indices.map(|i| i.value()));
+            }
+        }
+    }
+
+    let mut errors = Vec::new();
+    root.validate(root, gltf::json::Path::new, &mut |path, error| {
+        let path = path().0;
+        let excused = match error {
+            gltf::json::validation::Error::Unsupported => {
+                path.starts_with("extensionsRequired") && path.contains(KHR_DRACO)
+            }
+            gltf::json::validation::Error::Missing => path
+                .strip_prefix("accessors[")
+                .and_then(|rest| rest.strip_suffix("].bufferView"))
+                .and_then(|i| i.parse::<usize>().ok())
+                .is_some_and(|i| draco_accessors.contains(&i)),
+            _ => false,
+        };
+        if !excused {
+            errors.push(format!("{path}: {error}"));
+        }
+    });
+    if errors.is_empty() {
+        return Ok(());
+    }
+    const SHOWN: usize = 8;
+    let mut msg = format!("invalid glTF ({} errors)", errors.len());
+    for e in errors.iter().take(SHOWN) {
+        msg.push_str("\n  ");
+        msg.push_str(e);
+    }
+    if errors.len() > SHOWN {
+        msg.push_str(&format!("\n  … and {} more", errors.len() - SHOWN));
+    }
+    Err(anyhow!(msg))
+}
+
+fn draco_extension(p: &gltf::json::mesh::Primitive) -> Option<&gltf::json::Value> {
+    p.extensions.as_ref()?.others.get(KHR_DRACO)
+}
+
+/// Decoded (or plainly read) geometry of one primitive, before topology conversion.
+struct Geometry {
+    vertices: Vec<Vertex>,
+    has_normals: bool,
+    /// `None` means non-indexed.
+    indices: Option<Vec<u32>>,
+}
+
+fn read_plain(
     primitive: &gltf::Primitive,
     buffers: &[gltf::buffer::Data],
-) -> Result<Option<Primitive>> {
+) -> Option<Geometry> {
     let reader = primitive.reader(|b| buffers.get(b.index()).map(|d| &d.0[..]));
-    let Some(positions) = reader.read_positions() else {
-        return Ok(None);
-    };
-    let mut vertices: Vec<Vertex> = positions
+    let mut vertices: Vec<Vertex> = reader
+        .read_positions()?
         .map(|position| Vertex {
             position,
             ..Default::default()
@@ -138,16 +210,129 @@ fn convert_primitive(
             v.uv = uv;
         }
     }
+    let indices = reader.read_indices().map(|i| i.into_u32().collect());
+    Some(Geometry {
+        vertices,
+        has_normals,
+        indices,
+    })
+}
+
+fn read_draco(
+    document: &Document,
+    primitive: &gltf::Primitive,
+    ext: &gltf::json::Value,
+    buffers: &[gltf::buffer::Data],
+) -> Result<Option<Geometry>> {
+    let view_index = ext
+        .get("bufferView")
+        .and_then(|v| v.as_u64())
+        .context("KHR_draco_mesh_compression: missing bufferView")? as usize;
+    let view = document
+        .views()
+        .nth(view_index)
+        .with_context(|| format!("KHR_draco_mesh_compression: no bufferView {view_index}"))?;
+    let data = buffers
+        .get(view.buffer().index())
+        .and_then(|b| b.0.get(view.offset()..view.offset() + view.length()))
+        .context("KHR_draco_mesh_compression: bufferView out of range")?;
+
+    let mut mesh = draco_core::Mesh::new();
+    draco_core::MeshDecoder::new()
+        .decode(&mut draco_core::DecoderBuffer::new(data), &mut mesh)
+        .map_err(|e| anyhow!("Draco decode failed: {e}"))?;
+    let num_points = mesh.num_points();
+
+    // The extension maps glTF attribute semantics to Draco attribute unique ids;
+    // the primitive's own accessors describe the decoded type (e.g. normalization).
+    let attr_ids = ext.get("attributes");
+    let read = |semantic: gltf::Semantic, components: usize| -> Option<Vec<f32>> {
+        let id = attr_ids?.get(semantic.to_string())?.as_u64()? as u32;
+        let attribute = mesh.attribute_by_unique_id(id)?;
+        let mut values = attribute.read_f32s(num_points, components);
+        let accessor = primitive.get(&semantic);
+        if accessor.as_ref().is_some_and(|a| a.normalized()) {
+            let scale = match attribute.data_type() {
+                draco_core::DataType::Int8 => 1.0 / 127.0,
+                draco_core::DataType::Uint8 => 1.0 / 255.0,
+                draco_core::DataType::Int16 => 1.0 / 32767.0,
+                draco_core::DataType::Uint16 => 1.0 / 65535.0,
+                _ => 1.0,
+            };
+            for v in &mut values {
+                *v = (*v * scale).max(-1.0);
+            }
+        }
+        Some(values)
+    };
+
+    let Some(positions) = read(gltf::Semantic::Positions, 3) else {
+        return Ok(None);
+    };
+    let mut vertices: Vec<Vertex> = positions
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|&position| Vertex {
+            position,
+            ..Default::default()
+        })
+        .collect();
+    let normals = read(gltf::Semantic::Normals, 3);
+    if let Some(normals) = &normals {
+        for (v, &n) in vertices.iter_mut().zip(normals.as_chunks::<3>().0) {
+            v.normal = n;
+        }
+    }
+    if let Some(uvs) = read(gltf::Semantic::TexCoords(0), 2) {
+        for (v, &uv) in vertices.iter_mut().zip(uvs.as_chunks::<2>().0) {
+            v.uv = uv;
+        }
+    }
+    let indices = mesh
+        .faces()
+        .as_flattened()
+        .iter()
+        .map(|p| p.0)
+        .collect();
+    Ok(Some(Geometry {
+        vertices,
+        has_normals: normals.is_some(),
+        indices: Some(indices),
+    }))
+}
+
+fn convert_primitive(
+    document: &Document,
+    primitive: &gltf::Primitive,
+    buffers: &[gltf::buffer::Data],
+) -> Result<Option<Primitive>> {
+    let draco = primitive.extension_value(KHR_DRACO);
+    let geometry = match draco {
+        Some(ext) => read_draco(document, primitive, ext, buffers)?,
+        None => read_plain(primitive, buffers),
+    };
+    let Some(Geometry {
+        mut vertices,
+        has_normals,
+        indices,
+    }) = geometry
+    else {
+        return Ok(None);
+    };
 
     let n = vertices.len() as u32;
-    let raw: Vec<u32> = match reader.read_indices() {
-        Some(indices) => indices.into_u32().collect(),
-        None => (0..n).collect(),
-    };
+    let raw = indices.unwrap_or_else(|| (0..n).collect());
     if let Some(&bad) = raw.iter().find(|&&i| i >= n) {
-        anyhow::bail!("index {bad} out of range for {n} vertices");
+        bail!("index {bad} out of range for {n} vertices");
     }
-    let indices = match primitive.mode() {
+    // Draco always decodes to a triangle list.
+    let mode = if draco.is_some() {
+        Mode::Triangles
+    } else {
+        primitive.mode()
+    };
+    let indices = match mode {
         Mode::Triangles => raw,
         Mode::TriangleStrip => (0..raw.len().saturating_sub(2))
             .flat_map(|i| {
