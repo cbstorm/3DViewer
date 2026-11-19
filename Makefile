@@ -115,7 +115,8 @@ deb: linux-release
 		packaging/linux/control > $(DEB_ROOT)/DEBIAN/control
 	dpkg-deb --root-owner-group --build $(DEB_ROOT) $(DEB_ROOT).deb
 	@echo "Built $(DEB_ROOT).deb"
-
+install-deb:
+	sudo apt install ./$(DEB_ROOT).deb
 # ---------------------------------------------------------------- Windows
 
 WINDOWS_PKG := $(APP)-$(VERSION)-windows-x86_64
