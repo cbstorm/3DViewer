@@ -5,6 +5,7 @@ use gpu_allocator::MemoryLocation;
 use super::{
     descriptors::{Descriptors, MATERIAL_TEXTURES},
     device::Gpu,
+    frame::FRAMES_IN_FLIGHT,
     memory::{Buffer, Image, ImageDesc, SharedAllocator},
     upload::{mip_levels_for, record_texture_upload, Uploader},
 };
@@ -15,14 +16,20 @@ use crate::scene::{Scene, Texture, Vertex};
 pub struct GpuPrimitive {
     pub first_index: u32,
     pub index_count: u32,
+    /// Into the static vertex buffer, or the dynamic one if `dynamic`.
     pub vertex_offset: i32,
+    /// Animated vertices, streamed every frame.
+    pub dynamic: bool,
 }
 
-/// Device-local copy of a scene. All geometry lives in one vertex buffer and
-/// one index buffer, so drawing never rebinds buffers.
+/// Device-local copy of a scene. Static geometry lives in one vertex buffer
+/// and one index buffer. Deformed (skinned / morphed) vertices are rewritten
+/// every frame into a host-visible buffer, one per frame in flight.
 pub struct GpuScene {
     vertex_buffer: Buffer,
     index_buffer: Buffer,
+    dynamic_buffers: Vec<Buffer>,
+    dynamic_bytes: usize,
     textures: Vec<Image>,
     material_pool: vk::DescriptorPool,
     pub material_sets: Vec<vk::DescriptorSet>,
@@ -135,21 +142,29 @@ impl GpuScene {
 
         // Lay out every primitive back to back.
         let mut meshes = Vec::with_capacity(scene.meshes.len());
-        let (mut vertex_count, mut index_count) = (0usize, 0usize);
+        let (mut vertex_count, mut index_count, mut dynamic_count) = (0usize, 0usize, 0usize);
         for mesh in &scene.meshes {
             let mut prims = Vec::with_capacity(mesh.primitives.len());
             for p in &mesh.primitives {
+                let dynamic = p.deform.is_some();
+                let counter = if dynamic {
+                    &mut dynamic_count
+                } else {
+                    &mut vertex_count
+                };
                 prims.push(GpuPrimitive {
                     first_index: index_count as u32,
                     index_count: p.indices.len() as u32,
-                    vertex_offset: vertex_count as i32,
+                    vertex_offset: *counter as i32,
+                    dynamic,
                 });
-                vertex_count += p.vertices.len();
+                *counter += p.vertices.len();
                 index_count += p.indices.len();
             }
             meshes.push(prims);
         }
         let vertex_bytes = vertex_count * std::mem::size_of::<Vertex>();
+        let dynamic_bytes = dynamic_count * std::mem::size_of::<Vertex>();
         let index_bytes = index_count * std::mem::size_of::<u32>();
 
         let usage = vk::BufferUsageFlags::TRANSFER_DST;
@@ -188,9 +203,11 @@ impl GpuScene {
             let index_base = align(vertex_bytes, 16);
             let (mut v_off, mut i_off) = (0, index_base);
             for p in scene.meshes.iter().flat_map(|m| &m.primitives) {
-                staging.write(v_off, &p.vertices);
+                if p.deform.is_none() {
+                    staging.write(v_off, &p.vertices);
+                    v_off += std::mem::size_of_val(p.vertices.as_slice());
+                }
                 staging.write(i_off, &p.indices);
-                v_off += std::mem::size_of_val(p.vertices.as_slice());
                 i_off += std::mem::size_of_val(p.indices.as_slice());
             }
             let result = uploader.submit(gpu, |cmd| unsafe {
@@ -236,7 +253,7 @@ impl GpuScene {
                 upload_textures(gpu, allocator, uploader, &scene.textures)
             }
         });
-        let textures = match textures {
+        let mut textures = match textures {
             Ok(t) => t,
             Err(e) => {
                 vertex_buffer.destroy(device, allocator);
@@ -244,6 +261,35 @@ impl GpuScene {
                 return Err(e);
             }
         };
+        let mut dynamic_buffers = Vec::new();
+        for _ in 0..if dynamic_bytes > 0 {
+            FRAMES_IN_FLIGHT
+        } else {
+            0
+        } {
+            match Buffer::new(
+                device,
+                allocator,
+                "animated vertices",
+                dynamic_bytes as u64,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                MemoryLocation::CpuToGpu,
+            ) {
+                Ok(b) => dynamic_buffers.push(b),
+                Err(e) => {
+                    for t in &mut textures {
+                        t.destroy(device, allocator);
+                    }
+                    for b in [&mut vertex_buffer, &mut index_buffer]
+                        .into_iter()
+                        .chain(&mut dynamic_buffers)
+                    {
+                        b.destroy(device, allocator);
+                    }
+                    return Err(e);
+                }
+            }
+        }
 
         let material_pool =
             Descriptors::create_material_pool(device, scene.materials.len() as u32)?;
@@ -273,11 +319,14 @@ impl GpuScene {
         Ok(GpuScene {
             vertex_buffer,
             index_buffer,
+            dynamic_buffers,
+            dynamic_bytes,
             textures,
             material_pool,
             material_sets,
             meshes,
-            memory_bytes: (vertex_bytes + index_bytes) as u64 + texture_bytes,
+            memory_bytes: (vertex_bytes + index_bytes + dynamic_bytes * FRAMES_IN_FLIGHT) as u64
+                + texture_bytes,
         })
     }
 
@@ -288,10 +337,50 @@ impl GpuScene {
         }
     }
 
+    /// Bind the static vertex buffer, or frame `frame`'s animated one.
+    pub fn bind_vertices(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        dynamic: bool,
+        frame: usize,
+    ) {
+        let buffer = match self.dynamic_buffers.get(frame) {
+            Some(b) if dynamic => b.buffer,
+            _ => self.vertex_buffer.buffer,
+        };
+        unsafe { device.cmd_bind_vertex_buffers(cmd, 0, &[buffer], &[0]) };
+    }
+
+    /// Copy the current deformed vertices into frame `frame`'s buffer. The
+    /// caller must have waited for that frame's previous submission.
+    pub fn write_dynamic(&mut self, frame: usize, scene: &Scene) {
+        let Some(buffer) = self.dynamic_buffers.get_mut(frame) else {
+            return;
+        };
+        let mut offset = 0;
+        for d in scene
+            .meshes
+            .iter()
+            .flat_map(|m| &m.primitives)
+            .filter_map(|p| p.deform.as_ref())
+        {
+            let bytes = std::mem::size_of_val(d.output.as_slice());
+            if offset + bytes > self.dynamic_bytes {
+                break;
+            }
+            buffer.write(offset, &d.output);
+            offset += bytes;
+        }
+    }
+
     pub fn destroy(&mut self, device: &ash::Device, allocator: &SharedAllocator) {
         unsafe { device.destroy_descriptor_pool(self.material_pool, None) };
         for t in &mut self.textures {
             t.destroy(device, allocator);
+        }
+        for b in &mut self.dynamic_buffers {
+            b.destroy(device, allocator);
         }
         self.vertex_buffer.destroy(device, allocator);
         self.index_buffer.destroy(device, allocator);

@@ -75,6 +75,8 @@ pub fn load(path: &Path) -> Result<Scene> {
             transform: Mat4::IDENTITY,
             depth: 0,
             visible: true,
+            source: None,
+            skin: None,
         });
         meshes.push(Mesh {
             name,
@@ -91,6 +93,7 @@ pub fn load(path: &Path) -> Result<Scene> {
         nodes,
         up_axis: UpAxis::Y,
         load_time: Duration::ZERO,
+        rig: None,
     })
 }
 

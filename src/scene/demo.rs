@@ -47,6 +47,8 @@ pub fn demo_scene() -> Scene {
                 )),
                 depth: 0,
                 visible: true,
+                source: None,
+                skin: None,
             });
         }
     }
@@ -69,6 +71,8 @@ pub fn demo_scene() -> Scene {
             * Mat4::from_scale(Vec3::splat(0.6)),
         depth: 0,
         visible: true,
+        source: None,
+        skin: None,
     });
 
     Scene {
@@ -80,6 +84,7 @@ pub fn demo_scene() -> Scene {
         nodes,
         up_axis: UpAxis::Y,
         load_time: Duration::ZERO,
+        rig: None,
     }
 }
 

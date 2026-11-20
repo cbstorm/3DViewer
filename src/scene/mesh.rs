@@ -1,6 +1,8 @@
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 
+use super::animation::Deform;
+
 /// GPU vertex layout shared by every importer.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Pod, Zeroable)]
@@ -91,6 +93,9 @@ pub struct Primitive {
     /// Counts survive after the CPU-side geometry is released post-upload.
     pub vertex_count: usize,
     pub index_count: usize,
+    /// Skin / morph data when the vertices are animated. Such primitives are
+    /// drawn from a per-frame vertex buffer filled with `Deform::output`.
+    pub deform: Option<Box<Deform>>,
 }
 
 impl Primitive {
@@ -105,7 +110,19 @@ impl Primitive {
             indices,
             material,
             bounds,
+            deform: None,
         }
+    }
+
+    /// Adopt the deformed vertices: picking positions and bounds follow them.
+    pub fn sync_deformed(&mut self) {
+        let Some(d) = &self.deform else {
+            return;
+        };
+        self.positions.clear();
+        self.positions
+            .extend(d.output.iter().map(|v| Vec3::from(v.position)));
+        self.bounds = Aabb::from_points(self.positions.iter().copied());
     }
 
     pub fn triangle_count(&self) -> usize {

@@ -154,10 +154,13 @@ mod tests {
                     transform: Mat4::from_translation(Vec3::new(0.0, 0.0, z)),
                     depth: 0,
                     visible,
+                    source: None,
+                    skin: None,
                 })
                 .collect(),
             up_axis: UpAxis::Y,
             load_time: Duration::ZERO,
+            rig: None,
         }
     }
 

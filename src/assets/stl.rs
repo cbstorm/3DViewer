@@ -53,9 +53,12 @@ pub fn load(path: &Path) -> Result<Scene> {
             transform: Mat4::IDENTITY,
             depth: 0,
             visible: true,
+            source: None,
+            skin: None,
         }],
         // STL comes from CAD and 3D-printing tools, which are overwhelmingly Z-up.
         up_axis: UpAxis::Z,
         load_time: Duration::ZERO,
+        rig: None,
     })
 }

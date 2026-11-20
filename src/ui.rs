@@ -10,7 +10,7 @@ use sidebar::{Panels, Sidebar, Tab};
 
 use crate::{
     renderer::{FrameStats, GpuInfo, ViewMode, ViewSettings},
-    scene::{AlphaMode, OrbitCamera, Scene, UpAxis},
+    scene::{AlphaMode, ClipSelection, OrbitCamera, Playback, Rig, Scene, UpAxis},
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +35,7 @@ pub struct UiState {
     pub error: Option<String>,
     pub vsync: bool,
     pub continuous: bool,
+    pub playback: Playback,
 }
 
 impl Default for UiState {
@@ -48,6 +49,7 @@ impl Default for UiState {
             error: None,
             vsync: true,
             continuous: false,
+            playback: Playback::default(),
         }
     }
 }
@@ -90,7 +92,12 @@ pub fn draw(ui: &mut egui::Ui, cx: UiContext) -> UiOutput {
         hide_overlays,
     } = cx;
     let mut actions = Vec::new();
-    shortcuts(ui.ctx(), settings, state, &mut actions);
+    let rig = scene
+        .as_deref()
+        .and_then(|s| s.rig.as_ref())
+        .filter(|r| !r.animations.is_empty());
+    let duration = rig.map(|r| r.duration(state.playback.selection));
+    shortcuts(ui.ctx(), settings, state, duration, &mut actions);
 
     let has_model = scene.as_ref().is_some_and(|s| s.source.is_some());
     egui::Panel::top("menu").show(ui, |ui| {
@@ -100,6 +107,11 @@ pub fn draw(ui: &mut egui::Ui, cx: UiContext) -> UiOutput {
     egui::Panel::bottom("status").show(ui, |ui| {
         status_bar(ui, scene.as_deref(), timings, gpu, state)
     });
+    if let Some(rig) = scene.as_deref().and_then(|s| s.rig.as_ref()) {
+        if !rig.animations.is_empty() {
+            egui::Panel::bottom("timeline").show(ui, |ui| timeline(ui, rig, &mut state.playback));
+        }
+    }
 
     if state.show_scene_panel {
         egui::Panel::left("scene")
@@ -178,6 +190,7 @@ fn shortcuts(
     ctx: &egui::Context,
     settings: &mut ViewSettings,
     state: &mut UiState,
+    animation_duration: Option<f32>,
     actions: &mut Vec<UiAction>,
 ) {
     let open = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
@@ -221,6 +234,9 @@ fn shortcuts(
         }
         if pressed(Key::Escape) {
             state.selected_node = None;
+        }
+        if let Some(duration) = animation_duration.filter(|_| pressed(Key::Space)) {
+            state.playback.toggle(duration);
         }
         if i.key_pressed(Key::F1) {
             state.show_help ^= true;
@@ -356,6 +372,9 @@ fn scene_panel(
             row("Primitives", stats.primitives.to_string());
             row("Materials", scene.materials.len().to_string());
             row("Textures", scene.textures.len().to_string());
+            if scene.animation_count() > 0 {
+                row("Animations", scene.animation_count().to_string());
+            }
             row("Vertices", format_count(stats.vertices));
             row("Triangles", format_count(stats.triangles));
             row(
@@ -605,6 +624,89 @@ fn inspector(
     }
 }
 
+/// Animation transport, shown under the viewport when the model has clips.
+fn timeline(ui: &mut egui::Ui, rig: &Rig, pb: &mut Playback) {
+    let duration = rig.duration(pb.selection);
+    let clips = rig.animations.len();
+    let label = |s: ClipSelection| match s {
+        ClipSelection::None => "Rest pose".to_owned(),
+        ClipSelection::One(i) => rig.animations[i].name.clone(),
+        ClipSelection::All => format!("All clips ({clips})"),
+    };
+    ui.horizontal(|ui| {
+        let (icon, tip) = if pb.playing {
+            ("⏸", "Pause (Space)")
+        } else {
+            ("▶", "Play (Space)")
+        };
+        let can_play = pb.selection != ClipSelection::None;
+        if ui
+            .add_enabled(
+                can_play,
+                egui::Button::new(icon).min_size(egui::vec2(24.0, 0.0)),
+            )
+            .on_hover_text(tip)
+            .clicked()
+        {
+            pb.toggle(duration);
+        }
+        if ui
+            .add_enabled(can_play, egui::Button::new("⏮"))
+            .on_hover_text("Back to start")
+            .clicked()
+        {
+            pb.time = 0.0;
+        }
+
+        let before = pb.selection;
+        egui::ComboBox::from_id_salt("animation_clip")
+            .selected_text(label(pb.selection))
+            .width(200.0)
+            .truncate()
+            .show_ui(ui, |ui| {
+                if clips > 1 {
+                    let all = ClipSelection::All;
+                    ui.selectable_value(&mut pb.selection, all, label(all))
+                        .on_hover_text("Play every clip at once on a shared timeline");
+                }
+                for i in 0..clips {
+                    let one = ClipSelection::One(i);
+                    ui.selectable_value(&mut pb.selection, one, label(one));
+                }
+                let none = ClipSelection::None;
+                ui.selectable_value(&mut pb.selection, none, label(none));
+            });
+        if pb.selection != before {
+            pb.time = 0.0;
+            pb.playing = pb.selection != ClipSelection::None;
+        }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.checkbox(&mut pb.looping, "Loop");
+            ui.add(
+                egui::DragValue::new(&mut pb.speed)
+                    .range(0.05..=8.0)
+                    .speed(0.01)
+                    .fixed_decimals(2)
+                    .suffix("×"),
+            )
+            .on_hover_text("Playback speed");
+            ui.label(RichText::new(format!("{:.2} / {:.2} s", pb.time, duration)).monospace());
+            // The scrubber fills whatever width is left.
+            ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(40.0);
+            let mut t = pb.time;
+            let scrub = ui.add_enabled(
+                duration > 0.0,
+                egui::Slider::new(&mut t, 0.0..=duration.max(1e-3)).show_value(false),
+            );
+            if scrub.changed() {
+                pb.time = t;
+                pb.playing = false;
+            }
+        });
+    });
+}
+
 /// Camera control over the 3D viewport: drag to orbit, right/middle-drag or
 /// shift-drag to pan, scroll to zoom, double-click to fit. Returns the
 /// position of a left click (press and release without dragging).
@@ -694,6 +796,7 @@ fn help(ui: &mut egui::Ui) {
                 ("Ctrl + click panel header", "Open it, collapse the others"),
                 ("Ctrl+O", "Open model"),
                 ("Esc", "Clear selection"),
+                ("Space", "Play / pause animation"),
                 ("Drag & drop", "Open a .gltf, .glb, .obj or .stl file"),
             ] {
                 ui.strong(k);

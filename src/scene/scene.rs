@@ -2,7 +2,10 @@ use std::{path::PathBuf, time::Duration};
 
 use glam::Mat4;
 
-use super::mesh::{Aabb, Mesh};
+use super::{
+    animation::{ClipSelection, Rig},
+    mesh::{Aabb, Mesh},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AlphaMode {
@@ -63,6 +66,11 @@ pub struct Node {
     pub transform: Mat4,
     pub depth: usize,
     pub visible: bool,
+    /// The rig node this instance comes from; its transform follows the pose.
+    pub source: Option<usize>,
+    /// Skin deforming the mesh. Skinned vertices are posed in model space, so
+    /// the node's own transform is identity (as glTF specifies).
+    pub skin: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +99,8 @@ pub struct Scene {
     pub nodes: Vec<Node>,
     pub up_axis: UpAxis,
     pub load_time: Duration,
+    /// Node hierarchy, skins and animation clips, when the file has any.
+    pub rig: Option<Rig>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -149,6 +159,36 @@ impl Scene {
             }
         }
         s
+    }
+
+    pub fn animation_count(&self) -> usize {
+        self.rig.as_ref().map_or(0, |r| r.animations.len())
+    }
+
+    /// Evaluate the rig at `time`: update node transforms and re-deform
+    /// skinned / morphed primitives (their positions and bounds included).
+    pub fn pose(&mut self, selection: ClipSelection, time: f32) {
+        let Some(rig) = &self.rig else {
+            return;
+        };
+        let pose = rig.pose(selection, time);
+        for node in &mut self.nodes {
+            let Some(source) = node.source.filter(|&s| s < pose.world.len()) else {
+                continue;
+            };
+            let joints = node.skin.and_then(|s| pose.joints.get(s));
+            node.transform = if joints.is_some() {
+                Mat4::IDENTITY
+            } else {
+                pose.world[source]
+            };
+            for p in &mut self.meshes[node.mesh].primitives {
+                if let Some(d) = &mut p.deform {
+                    d.apply(&pose.weights[source], joints.map(Vec::as_slice));
+                    p.sync_deformed();
+                }
+            }
+        }
     }
 
     /// Make sure every primitive points at a valid material.

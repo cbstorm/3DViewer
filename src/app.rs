@@ -15,7 +15,7 @@ use winit::{
 use crate::{
     assets,
     renderer::{EguiFrame, FrameInput, Renderer, ViewSettings},
-    scene::{demo::demo_scene, OrbitCamera, Scene},
+    scene::{demo::demo_scene, Aabb, ClipSelection, OrbitCamera, Playback, Scene},
     ui::{self, Timings, UiAction, UiContext, UiState},
 };
 
@@ -130,6 +130,12 @@ struct Viewer {
     loading: Option<PathBuf>,
     /// Width / height of the 3D viewport, kept for fit/reset outside a frame.
     viewport_aspect: f32,
+    /// Grid placement; updated when the scene changes, not as it animates.
+    grid_bounds: Option<Aabb>,
+    /// Clip and time the scene is currently posed at.
+    posed: Option<(ClipSelection, f32)>,
+    /// When playback last advanced; `None` while paused.
+    anim_clock: Option<Instant>,
 
     timings: Timings,
     last_frame: Instant,
@@ -179,6 +185,9 @@ impl Viewer {
             ui,
             loading: None,
             viewport_aspect: 1.6,
+            grid_bounds: None,
+            posed: None,
+            anim_clock: None,
             timings: Timings::default(),
             last_frame: Instant::now(),
             repaint_at: None,
@@ -302,7 +311,13 @@ impl Viewer {
     /// Upload a scene to the GPU and make it current. Vertex data is released
     /// afterwards; counts, bounds, positions and indices are kept.
     fn set_scene(&mut self, mut scene: Scene) -> Result<()> {
+        let playback = Playback::for_rig(scene.rig.as_ref(), &self.ui.playback);
+        scene.pose(playback.selection, playback.time);
         self.renderer.upload_scene(&scene)?;
+        self.ui.playback = playback;
+        self.posed = Some((playback.selection, playback.time));
+        self.anim_clock = None;
+        self.grid_bounds = Some(scene.bounds());
         for p in scene.meshes.iter_mut().flat_map(|m| &mut m.primitives) {
             p.release_geometry();
         }
@@ -364,8 +379,43 @@ impl Viewer {
         }
     }
 
+    /// Move the playhead by the wall-clock time since the last frame.
+    fn advance_playback(&mut self, now: Instant) {
+        let playback = &mut self.ui.playback;
+        if !playback.playing {
+            self.anim_clock = None;
+            return;
+        }
+        // Clamp so a stall (window drag, file dialog) doesn't skip ahead.
+        let dt = self
+            .anim_clock
+            .map_or(0.0, |t| now.duration_since(t).as_secs_f32().min(0.25));
+        self.anim_clock = Some(now);
+        let duration = self
+            .scene
+            .as_ref()
+            .and_then(|s| s.rig.as_ref())
+            .map_or(0.0, |r| r.duration(playback.selection));
+        playback.advance(dt, duration);
+    }
+
+    /// Re-pose the scene if the playhead moved or the clip changed.
+    fn apply_playback(&mut self) {
+        let Playback {
+            selection, time, ..
+        } = self.ui.playback;
+        if self.posed == Some((selection, time)) {
+            return;
+        }
+        if let Some(scene) = &mut self.scene {
+            scene.pose(selection, time);
+        }
+        self.posed = Some((selection, time));
+    }
+
     fn frame(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         let start = Instant::now();
+        self.advance_playback(start);
         let raw_input = self.egui_state.take_egui_input(&self.window);
 
         let gpu_info = self.renderer.info();
@@ -389,6 +439,7 @@ impl Viewer {
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
         let output = output.expect("ui ran");
+        self.apply_playback();
 
         let ppp = full_output.pixels_per_point;
         let viewport = output.viewport;
@@ -413,9 +464,15 @@ impl Viewer {
                         self.camera.fit(&s.bounds(), self.viewport_aspect);
                     }
                 }
-                UiAction::ResetView | UiAction::SceneChanged => {
+                UiAction::ResetView => {
                     if let Some(s) = &self.scene {
                         self.camera.reset(&s.bounds(), self.viewport_aspect);
+                    }
+                }
+                UiAction::SceneChanged => {
+                    if let Some(s) = &self.scene {
+                        self.camera.reset(&s.bounds(), self.viewport_aspect);
+                        self.grid_bounds = Some(s.bounds());
                     }
                 }
                 UiAction::Quit => event_loop.exit(),
@@ -440,6 +497,7 @@ impl Viewer {
                 camera: &self.camera,
                 settings: &self.settings,
                 selected_node: self.ui.selected_node,
+                grid_bounds: self.grid_bounds,
                 viewport: [
                     viewport.min.x * ppp,
                     viewport.min.y * ppp,
@@ -495,7 +553,11 @@ impl Viewer {
             .viewport_output
             .get(&egui::ViewportId::ROOT)
             .map_or(Duration::MAX, |v| v.repaint_delay);
-        if self.ui.continuous || self.loading.is_some() || repaint_delay.is_zero() {
+        if self.ui.continuous
+            || self.ui.playback.playing
+            || self.loading.is_some()
+            || repaint_delay.is_zero()
+        {
             self.window.request_redraw();
         } else if repaint_delay < Duration::from_secs(3600) {
             self.repaint_at = Some(Instant::now() + repaint_delay);

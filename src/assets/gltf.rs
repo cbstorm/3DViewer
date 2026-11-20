@@ -5,11 +5,13 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use glam::Mat4;
-use gltf::{json::validation::Validate, mesh::Mode, Document, Gltf};
+use glam::{Mat4, Quat, Vec3};
+use gltf::{animation::util::ReadOutputs, json::validation::Validate, mesh::Mode, Document, Gltf};
 
 use crate::scene::{
-    generate_normals, AlphaMode, Material, Mesh, Node, Primitive, Scene, Texture, UpAxis, Vertex,
+    animation::{Animation, Channel, Interpolation, MorphTarget, Property, RigNode, Skin, Trs},
+    generate_normals, AlphaMode, Deform, Material, Mesh, Node, Primitive, Rig, Scene, Texture,
+    UpAxis, Vertex,
 };
 
 const KHR_DRACO: &str = "KHR_draco_mesh_compression";
@@ -63,13 +65,19 @@ pub fn load(path: &Path) -> Result<Scene> {
     }
 
     let mut nodes = Vec::new();
+    let mut instancer = Instancer {
+        mesh_map: &mesh_map,
+        meshes: &mut meshes,
+        deformed_in_use: HashSet::new(),
+        out: &mut nodes,
+    };
     match document
         .default_scene()
         .or_else(|| document.scenes().next())
     {
         Some(scene) => {
             for root in scene.nodes() {
-                visit_node(&root, Mat4::IDENTITY, 0, &mesh_map, &mut nodes);
+                instancer.visit(&root, Mat4::IDENTITY, 0);
             }
         }
         // No scene graph: show each mesh once at the origin.
@@ -81,10 +89,19 @@ pub fn load(path: &Path) -> Result<Scene> {
                     transform: Mat4::IDENTITY,
                     depth: 0,
                     visible: true,
+                    source: None,
+                    skin: None,
                 });
             }
         }
     }
+
+    let deformed = meshes
+        .iter()
+        .flat_map(|m| &m.primitives)
+        .any(|p| p.deform.is_some());
+    let rig = (deformed || document.animations().len() > 0 || document.skins().len() > 0)
+        .then(|| load_rig(&document, &buffers));
 
     Ok(Scene {
         name: String::new(),
@@ -95,32 +112,161 @@ pub fn load(path: &Path) -> Result<Scene> {
         nodes,
         up_axis: UpAxis::Y,
         load_time: Duration::ZERO,
+        rig,
     })
 }
 
-fn visit_node(
-    node: &gltf::Node,
-    parent: Mat4,
-    depth: usize,
-    mesh_map: &[Option<usize>],
-    out: &mut Vec<Node>,
-) {
-    let transform = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
-    if let Some(mesh) = node.mesh().and_then(|m| mesh_map[m.index()]) {
-        out.push(Node {
-            name: node
+/// Flattens the scene graph into mesh instances.
+struct Instancer<'a> {
+    /// glTF mesh index -> our mesh index.
+    mesh_map: &'a [Option<usize>],
+    meshes: &'a mut Vec<Mesh>,
+    /// Deformed meshes already claimed by an instance. Deformed vertices are
+    /// per instance, so a second instance gets its own copy of the mesh.
+    deformed_in_use: HashSet<usize>,
+    out: &'a mut Vec<Node>,
+}
+
+impl Instancer<'_> {
+    fn visit(&mut self, node: &gltf::Node, parent: Mat4, depth: usize) {
+        let transform = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
+        if let Some(mut mesh) = node.mesh().and_then(|m| self.mesh_map[m.index()]) {
+            let prims = &self.meshes[mesh].primitives;
+            if prims.iter().any(|p| p.deform.is_some()) && !self.deformed_in_use.insert(mesh) {
+                let copy = self.meshes[mesh].clone();
+                self.meshes.push(copy);
+                mesh = self.meshes.len() - 1;
+                self.deformed_in_use.insert(mesh);
+            }
+            let prims = &self.meshes[mesh].primitives;
+            // Skinning needs influences on every primitive: the node transform
+            // is dropped for skinned meshes, so an unskinned part would misplace.
+            let skinned = prims
+                .iter()
+                .all(|p| p.deform.as_ref().is_some_and(|d| d.is_skinned()));
+            let skin = node.skin().filter(|_| skinned).map(|s| s.index());
+            if node.skin().is_some() && skin.is_none() {
+                tracing::warn!(
+                    "node {}: skin ignored, mesh has no joint weights",
+                    node.index()
+                );
+            }
+            self.out.push(Node {
+                name: node
+                    .name()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Node {}", node.index())),
+                mesh,
+                transform,
+                depth,
+                visible: true,
+                source: Some(node.index()),
+                skin,
+            });
+        }
+        for child in node.children() {
+            self.visit(&child, transform, depth + 1);
+        }
+    }
+}
+
+fn load_rig(document: &Document, buffers: &[gltf::buffer::Data]) -> Rig {
+    let get = |b: gltf::Buffer| buffers.get(b.index()).map(|d| &d.0[..]);
+
+    let mut nodes: Vec<RigNode> = document
+        .nodes()
+        .map(|n| {
+            let (t, r, s) = n.transform().decomposed();
+            RigNode {
+                parent: None,
+                rest_matrix: Mat4::from_cols_array_2d(&n.transform().matrix()),
+                rest: Trs {
+                    translation: Vec3::from(t),
+                    rotation: Quat::from_array(r).normalize(),
+                    scale: Vec3::from(s),
+                },
+                weights: n
+                    .weights()
+                    .or_else(|| n.mesh().and_then(|m| m.weights()))
+                    .unwrap_or_default()
+                    .to_vec(),
+            }
+        })
+        .collect();
+    for n in document.nodes() {
+        for child in n.children() {
+            // A node with two parents is invalid glTF; keep the first.
+            nodes[child.index()].parent.get_or_insert(n.index());
+        }
+    }
+
+    let skins = document
+        .skins()
+        .map(|skin| {
+            let joints: Vec<usize> = skin.joints().map(|j| j.index()).collect();
+            let mut inverse_bind: Vec<Mat4> = skin
+                .reader(get)
+                .read_inverse_bind_matrices()
+                .map(|m| m.map(|m| Mat4::from_cols_array_2d(&m)).collect())
+                .unwrap_or_default();
+            inverse_bind.resize(joints.len(), Mat4::IDENTITY);
+            Skin {
+                joints,
+                inverse_bind,
+            }
+        })
+        .collect();
+
+    let animations = document
+        .animations()
+        .map(|anim| {
+            let channels = anim
+                .channels()
+                .filter_map(|ch| {
+                    let reader = ch.reader(get);
+                    let times: Vec<f32> = reader.read_inputs()?.collect();
+                    let (property, values): (Property, Vec<f32>) = match reader.read_outputs()? {
+                        ReadOutputs::Translations(v) => {
+                            (Property::Translation, v.flatten().collect())
+                        }
+                        ReadOutputs::Rotations(v) => {
+                            (Property::Rotation, v.into_f32().flatten().collect())
+                        }
+                        ReadOutputs::Scales(v) => (Property::Scale, v.flatten().collect()),
+                        ReadOutputs::MorphTargetWeights(v) => {
+                            (Property::Weights, v.into_f32().collect())
+                        }
+                    };
+                    let interpolation = match ch.sampler().interpolation() {
+                        gltf::animation::Interpolation::Step => Interpolation::Step,
+                        gltf::animation::Interpolation::Linear => Interpolation::Linear,
+                        gltf::animation::Interpolation::CubicSpline => Interpolation::CubicSpline,
+                    };
+                    let channel = Channel::new(
+                        ch.target().node().index(),
+                        property,
+                        interpolation,
+                        times,
+                        values,
+                    );
+                    if channel.is_none() {
+                        tracing::warn!(
+                            "animation {}: skipping channel with mismatched keyframes",
+                            anim.index()
+                        );
+                    }
+                    channel
+                })
+                .collect();
+            let name = anim
                 .name()
                 .map(str::to_owned)
-                .unwrap_or_else(|| format!("Node {}", node.index())),
-            mesh,
-            transform,
-            depth,
-            visible: true,
-        });
-    }
-    for child in node.children() {
-        visit_node(&child, transform, depth + 1, mesh_map, out);
-    }
+                .unwrap_or_else(|| format!("Animation {}", anim.index()));
+            Animation::new(name, channels)
+        })
+        .collect();
+
+    Rig::new(nodes, skins, animations)
 }
 
 /// Run the glTF crate's validation, ignoring only what Draco compression explains:
@@ -181,12 +327,12 @@ struct Geometry {
     has_normals: bool,
     /// `None` means non-indexed.
     indices: Option<Vec<u32>>,
+    /// JOINTS_0 / WEIGHTS_0.
+    influences: Option<Vec<([u16; 4], [f32; 4])>>,
+    targets: Vec<MorphTarget>,
 }
 
-fn read_plain(
-    primitive: &gltf::Primitive,
-    buffers: &[gltf::buffer::Data],
-) -> Option<Geometry> {
+fn read_plain(primitive: &gltf::Primitive, buffers: &[gltf::buffer::Data]) -> Option<Geometry> {
     let reader = primitive.reader(|b| buffers.get(b.index()).map(|d| &d.0[..]));
     let mut vertices: Vec<Vertex> = reader
         .read_positions()?
@@ -211,10 +357,23 @@ fn read_plain(
         }
     }
     let indices = reader.read_indices().map(|i| i.into_u32().collect());
+    let influences = match (reader.read_joints(0), reader.read_weights(0)) {
+        (Some(j), Some(w)) => Some(j.into_u16().zip(w.into_f32()).collect()),
+        _ => None,
+    };
+    let targets = reader
+        .read_morph_targets()
+        .map(|(positions, normals, _)| MorphTarget {
+            positions: positions.map(Iterator::collect),
+            normals: normals.map(Iterator::collect),
+        })
+        .collect();
     Some(Geometry {
         vertices,
         has_normals,
         indices,
+        influences,
+        targets,
     })
 }
 
@@ -289,16 +448,31 @@ fn read_draco(
             v.uv = uv;
         }
     }
-    let indices = mesh
-        .faces()
-        .as_flattened()
-        .iter()
-        .map(|p| p.0)
-        .collect();
+    let influences = match (
+        read(gltf::Semantic::Joints(0), 4),
+        read(gltf::Semantic::Weights(0), 4),
+    ) {
+        (Some(j), Some(w)) => Some(
+            j.as_chunks::<4>()
+                .0
+                .iter()
+                .zip(w.as_chunks::<4>().0)
+                .map(|(j, &w)| (j.map(|j| j as u16), w))
+                .collect(),
+        ),
+        _ => None,
+    };
+    let indices = mesh.faces().as_flattened().iter().map(|p| p.0).collect();
+    // Morph targets can't be used: Draco reorders the vertices they refer to.
+    if primitive.morph_targets().len() > 0 {
+        tracing::warn!("Draco primitive: morph targets are not supported, ignoring them");
+    }
     Ok(Some(Geometry {
         vertices,
         has_normals: normals.is_some(),
         indices: Some(indices),
+        influences,
+        targets: Vec::new(),
     }))
 }
 
@@ -316,6 +490,8 @@ fn convert_primitive(
         mut vertices,
         has_normals,
         indices,
+        influences,
+        targets,
     }) = geometry
     else {
         return Ok(None);
@@ -354,7 +530,10 @@ fn convert_primitive(
     }
 
     let material = primitive.material().index().unwrap_or(usize::MAX);
-    Ok(Some(Primitive::new(vertices, indices, material)))
+    let deform = Deform::new(&vertices, influences, targets).map(Box::new);
+    let mut p = Primitive::new(vertices, indices, material);
+    p.deform = deform;
+    Ok(Some(p))
 }
 
 struct Textures<'a> {
@@ -473,5 +652,100 @@ fn convert_material(m: &gltf::Material, textures: &mut Textures) -> Material {
             gltf::material::AlphaMode::Mask => AlphaMode::Mask(m.alpha_cutoff().unwrap_or(0.5)),
             gltf::material::AlphaMode::Blend => AlphaMode::Blend,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::ClipSelection;
+
+    /// A triangle skinned to one joint whose translation is animated from
+    /// (0, 0, 0) to (0, 2, 0) over one second. The mesh node has a transform
+    /// that must be ignored once skinned.
+    fn write_skinned_gltf(dir: &Path) -> std::path::PathBuf {
+        let mut bin: Vec<u8> = Vec::new();
+        let f32s =
+            |bin: &mut Vec<u8>, v: &[f32]| v.iter().for_each(|x| bin.extend(x.to_le_bytes()));
+        f32s(&mut bin, &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]); // 0: positions, 36 B
+        for _ in 0..3 {
+            [0u16, 0, 0, 0]
+                .iter()
+                .for_each(|j| bin.extend(j.to_le_bytes())); // 36: joints, 24 B
+        }
+        for _ in 0..3 {
+            f32s(&mut bin, &[1.0, 0.0, 0.0, 0.0]); // 60: weights, 48 B
+        }
+        f32s(&mut bin, &[0.0, 1.0]); // 108: times, 8 B
+        f32s(&mut bin, &[0.0, 0.0, 0.0, 0.0, 2.0, 0.0]); // 116: translations, 24 B
+        assert_eq!(bin.len(), 140);
+        std::fs::write(dir.join("skin.bin"), &bin).unwrap();
+
+        let json = r#"{
+          "asset": {"version": "2.0"},
+          "scene": 0,
+          "scenes": [{"nodes": [0, 1]}],
+          "nodes": [
+            {"name": "body", "mesh": 0, "skin": 0, "translation": [5, 5, 5]},
+            {"name": "bone"}
+          ],
+          "skins": [{"joints": [1]}],
+          "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "JOINTS_0": 1, "WEIGHTS_0": 2}}]}],
+          "animations": [{
+            "name": "lift",
+            "samplers": [{"input": 3, "output": 4, "interpolation": "LINEAR"}],
+            "channels": [{"sampler": 0, "target": {"node": 1, "path": "translation"}}]
+          }],
+          "buffers": [{"uri": "skin.bin", "byteLength": 140}],
+          "bufferViews": [
+            {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+            {"buffer": 0, "byteOffset": 36, "byteLength": 24},
+            {"buffer": 0, "byteOffset": 60, "byteLength": 48},
+            {"buffer": 0, "byteOffset": 108, "byteLength": 8},
+            {"buffer": 0, "byteOffset": 116, "byteLength": 24}
+          ],
+          "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0]},
+            {"bufferView": 1, "componentType": 5123, "count": 3, "type": "VEC4"},
+            {"bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC4"},
+            {"bufferView": 3, "componentType": 5126, "count": 2, "type": "SCALAR", "min": [0], "max": [1]},
+            {"bufferView": 4, "componentType": 5126, "count": 2, "type": "VEC3"}
+          ]
+        }"#;
+        let path = dir.join("skin.gltf");
+        std::fs::write(&path, json).unwrap();
+        path
+    }
+
+    #[test]
+    fn loads_and_poses_skinned_animation() {
+        let dir = std::env::temp_dir().join(format!("viewer3d-test-skin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut scene = load(&write_skinned_gltf(&dir)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let rig = scene.rig.as_ref().unwrap();
+        assert_eq!(rig.animations.len(), 1);
+        assert_eq!(rig.animations[0].name, "lift");
+        assert_eq!(rig.duration(ClipSelection::One(0)), 1.0);
+        assert_eq!(scene.nodes.len(), 1);
+        assert_eq!(scene.nodes[0].skin, Some(0));
+
+        scene.pose(ClipSelection::One(0), 0.5);
+        // Skinned: the node's own translation is ignored, the joint moves the vertices.
+        assert_eq!(scene.nodes[0].transform, Mat4::IDENTITY);
+        let p = &scene.meshes[0].primitives[0];
+        assert_eq!(p.positions[1], Vec3::new(1.0, 1.0, 0.0));
+        assert_eq!(
+            p.deform.as_ref().unwrap().output[2].position,
+            [0.0, 2.0, 0.0]
+        );
+        assert_eq!(p.bounds.min.y, 1.0);
+
+        scene.pose(ClipSelection::None, 0.5);
+        assert_eq!(
+            scene.meshes[0].primitives[0].positions[1],
+            Vec3::new(1.0, 0.0, 0.0)
+        );
     }
 }

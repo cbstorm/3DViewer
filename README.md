@@ -3,15 +3,22 @@
 A small, fast desktop viewer for **glTF/GLB, OBJ and STL** models, written in Rust on
 Vulkan (`ash`) with an `egui` interface. It follows the design in [requirements.md](requirements.md).
 
+![3D Viewer showing an animated palletizing factory scene (glTF), with the scene panel, viewport sidebar and animation timeline](docs/screenshot.png)
+
 ## Features
 
 - Formats: glTF 2.0 / GLB (node hierarchy, PBR metallic-roughness materials, base color /
-  metal-rough / emissive textures, alpha mask and blend), OBJ + MTL (textures, transparency),
+  metal-rough / emissive textures, alpha mask and blend, animation), OBJ + MTL (textures, transparency),
   binary and ASCII STL (flat-shaded, auto Z-up).
 - Rendering: reverse-Z depth with an infinite far plane, 4x MSAA, one camera-attached
   directional light plus hemispheric ambient, two-sided shading, mipmapped textures.
 - View modes: shaded, shaded + wireframe, wireframe, normals. Ground grid, scene bounds,
   highlighted bounds for the selected node.
+- Animation (glTF): node TRS clips with step / linear / cubic-spline keys, skinning
+  (four joints per vertex) and morph targets. A timeline under the viewport plays, pauses,
+  scrubs, loops and changes speed, and picks a clip — or *All clips* for files that animate
+  each object in its own clip (the default when clips don't overlap). Models open paused at
+  the first frame; press `Space` or ▶ to play.
 - Camera: orbit, pan, zoom, fit-to-model, reset.
 - UI: scene panel (stats, up axis, per-node visibility); a Blender-style viewport sidebar
   (`N`) with Item / View / Light tabs and collapsible panels, holding the material inspector
@@ -89,6 +96,7 @@ Platform notes for packaging:
 | `Ctrl` + click panel header | Open that panel, collapse the others |
 | `Ctrl+O` | Open model |
 | `Esc` | Clear selection |
+| `Space` | Play / pause animation |
 | `F1` | Controls help |
 
 Files can also be dropped onto the window. winit 0.30 does not support file drops on
@@ -106,7 +114,8 @@ src/
 │   ├── gltf.rs  obj.rs  stl.rs
 ├── scene/
 │   ├── mesh.rs        Vertex, Primitive, Mesh, Aabb, normal generation
-│   ├── scene.rs       Material, Texture, Node, Scene, up axis
+│   ├── scene.rs       Material, Texture, Node, Scene, up axis, posing
+│   ├── animation.rs   rig (node hierarchy, skins, clips), sampling, skin/morph deformation
 │   ├── camera.rs      orbit camera, frustum culling
 │   └── demo.rs        built-in startup scene
 └── renderer/
@@ -129,6 +138,11 @@ Notes:
   uploaded through a single staging buffer. Draws are frustum-culled per primitive, sorted
   by material, and blended primitives are drawn back to front after opaque ones.
 - After upload, CPU-side vertex and index data is released; only counts and bounds remain.
+- Animated models keep the glTF node hierarchy as a `Rig`. Each frame that the playhead
+  moves, the rig is posed: mesh-instance transforms follow it, and skinned / morphed
+  primitives are deformed on the CPU and written into a host-visible vertex buffer (one per
+  frame in flight). Static geometry stays in the device-local buffer; shaders are unchanged,
+  and picking and bounds follow the animated pose.
 - Two frames in flight, per-swapchain-image "render finished" semaphores, and swapchain
   recreation on resize or `VK_ERROR_OUT_OF_DATE_KHR`.
 - The scene pass renders into a multisampled target that resolves into the swapchain image.
@@ -145,5 +159,5 @@ Notes:
 
 ## Not yet implemented
 
-Normal maps (no tangents), skinning and animation, glTF texture transforms and secondary UV
+Normal maps (no tangents), skins with more than four joints per vertex (`JOINTS_1`), glTF texture transforms and secondary UV
 sets, image-based lighting, and multi-draw indirect.

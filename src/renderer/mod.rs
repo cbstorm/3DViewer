@@ -98,6 +98,9 @@ pub struct FrameInput<'a> {
     pub camera: &'a OrbitCamera,
     pub settings: &'a ViewSettings,
     pub selected_node: Option<usize>,
+    /// Where the grid sits. Kept steady while the model animates, so the
+    /// floor doesn't follow every motion.
+    pub grid_bounds: Option<Aabb>,
     /// 3D viewport in physical pixels: x, y, width, height.
     pub viewport: [f32; 4],
     pub egui: EguiFrame,
@@ -367,6 +370,11 @@ impl Renderer {
             for delta in &deltas {
                 egui.set_texture(self.gpu.queue, self.uploader.pool, id, delta)?;
             }
+        }
+
+        // The fence above guarantees this frame's animated vertex buffer is idle.
+        if let (Some(gpu_scene), Some(scene)) = (self.gpu_scene.as_mut(), input.scene) {
+            gpu_scene.write_dynamic(fi, scene);
         }
 
         let frame = &mut self.frames[fi];
@@ -778,7 +786,7 @@ impl Renderer {
         let scene_bounds = input.scene.map(|s| s.bounds());
 
         if settings.show_grid {
-            let bounds = scene_bounds.unwrap_or(Aabb {
+            let bounds = input.grid_bounds.or(scene_bounds).unwrap_or(Aabb {
                 min: Vec3::splat(-1.0),
                 max: Vec3::splat(1.0),
             });
@@ -842,7 +850,13 @@ impl Renderer {
         let draw_list =
             |items: &[DrawItem], mode: f32, flat_color: Vec4, stats: &mut FrameStats| {
                 let mut bound_material = usize::MAX;
+                let mut bound_dynamic = None;
                 for d in items {
+                    let gp = gpu_scene.meshes[d.mesh][d.primitive];
+                    if bound_dynamic != Some(gp.dynamic) {
+                        gpu_scene.bind_vertices(device, cmd, gp.dynamic, self.frame_index);
+                        bound_dynamic = Some(gp.dynamic);
+                    }
                     let material = &scene.materials[d.material];
                     if d.material != bound_material {
                         unsafe {
@@ -871,7 +885,6 @@ impl Renderer {
                         emissive: Vec3::from(material.emissive).extend(0.0),
                         params: Vec4::new(material.metallic, material.roughness, mode, cutoff),
                     };
-                    let gp = gpu_scene.meshes[d.mesh][d.primitive];
                     unsafe {
                         self.push(cmd, layout, &push);
                         device.cmd_draw_indexed(
